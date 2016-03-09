@@ -2,63 +2,83 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build go1.5
-
-// Stringer is a tool to automate the creation of methods that satisfy the fmt.Stringer
-// interface. Given the name of a (signed or unsigned) integer type T that has constants
-// defined, stringer will create a new self-contained Go source file implementing
+// Enumerator is a tool to automate the creation of methods that satisfy
+// fmt.Stringer, sql.Scanner, driver.Valuer, encoding.TextMarshaler and
+// encoding.TextUnmarshaler interfaces.
+// Given the name of a (signed or unsigned) integer type T that has
+// constants defined, enumerator will create a new self-contained Go
+// source file implementing
 //	func (t T) String() string
-// The file is created in the same package and directory as the package that defines T.
-// It has helpful defaults designed for use with go generate.
-//
-// Stringer works best with constants that are consecutive values such as created using iota,
-// but creates good code regardless. In the future it might also provide custom support for
-// constant sets that are bit patterns.
+//	func (t T) Value() (driver.Value, error)
+//	func (t T) MarshalText() ([]byte, error)
+//	func (t *T) Scan(interface{}) error
+//	func (t *T) UnmarshalText([]byte) error
+// The file is created in the same package and directory as the package
+// that defines T. It has helpful defaults designed for use with go
+// generate.
 //
 // For example, given this snippet,
 //
-//	package painkiller
+//	package enum
 //
-//	type Pill int
+//	type NewEnum int
 //
 //	const (
-//		Placebo Pill = iota
-//		Aspirin
-//		Ibuprofen
-//		Paracetamol
-//		Acetaminophen = Paracetamol
+//		Invalid NewEnum = iota
+//		Const1
+//		Const2
+//		Const3
 //	)
+//
+//	var newEnums = [...]string{
+//		"invalid",
+//		"string1",
+//		"string2",
+//		"string3",
+//	}
 //
 // running this command
 //
-//	stringer -type=Pill
+//	enumerator -type=NewEnum
 //
-// in the same directory will create the file pill_string.go, in package painkiller,
-// containing a definition of
+// in the same directory will create the file newenum_enum.go,
+// in package enum, containing a definition of
 //
-//	func (Pill) String() string
+//	func (NewEnum) String() string
+//	func (NewEnum) Value() (driver.Value, error)
+//	func (NewEnum) MarshalText() ([]byte, error)
+//	func (NewEnum) Parse(string) error
+//	func (NewEnum) Scan(interface{}) error
+//	func (NewEnum) UnmarshalText([]byte) error
 //
-// That method will translate the value of a Pill constant to the string representation
-// of the respective constant name, so that the call fmt.Print(painkiller.Aspirin) will
-// print the string "Aspirin".
+// That method will translate the value of a Enum constant to the string
+// representation of the respective constant name, so that the call
+// fmt.Print(enum.Const2) will print the string "string2".
 //
 // Typically this process would be run using go generate, like this:
 //
-//	//go:generate stringer -type=Pill
+//	//go:generate enumerator -output=new_enum_methods.go -type=NewEnum -map=newEnums
 //
-// If multiple constants have the same value, the lexically first matching name will
-// be used (in the example, Acetaminophen will print as "Paracetamol").
+// If multiple constants have the same value, the behaviour is undefined.
 //
 // With no arguments, it processes the package in the current directory.
-// Otherwise, the arguments must name a single directory holding a Go package
-// or a set of Go source files that represent a single Go package.
+// Otherwise, the arguments must name a single directory holding a Go
+// package or a set of Go source files that represent a single Go package.
 //
-// The -type flag accepts a comma-separated list of types so a single run can
-// generate methods for multiple types. The default output file is t_string.go,
-// where t is the lower-cased name of the first type listed. It can be overridden
-// with the -output flag.
+// The -type flag accepts a comma-separated list of types so a single
+// run can generate methods for multiple types.
+// By default, it assumes that an array or a map with name ts is defined
+// and populated with the corresponding string values, where t is the same
+// name as T with only first letter lowered and 's' appended at the end.
+// The default output file is t_enum.go, where t is the lower-cased name
+// of the first type listed. It can be overridden with the -output flag.
 //
-package main // import "golang.org/x/tools/cmd/stringer"
+// Note: this is a very rudimentary extension built on top of the stringer
+// utility provided as a go lang tool. It needs to be refined a lot. And,
+// by a lot, I really mean a lot and that excludes coming up with new tests
+// and fix (remove, if irrelevant) existing tests.
+//
+package main
 
 import (
 	"bytes"
@@ -78,20 +98,21 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"text/template"
+	"unicode"
 )
 
 var (
 	typeNames = flag.String("type", "", "comma-separated list of type names; must be set")
-	output    = flag.String("output", "", "output file name; default srcdir/<type>_string.go")
+	output    = flag.String("output", "", "output file name; default srcdir/<firsttype>_enum.go")
+	mapNames = flag.String("maps", "", "comma-separated list of map names; assumed to be with the same name\n    \tas type name with first letter lowered and 's' appended at the end;\n    \tmap names, if provided, are not validated in any manner")
 )
 
 // Usage is a replacement usage function for the flags package.
 func Usage() {
 	fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "\tstringer [flags] -type T [directory]\n")
-	fmt.Fprintf(os.Stderr, "\tstringer [flags[ -type T files... # Must be a single package\n")
-	fmt.Fprintf(os.Stderr, "For more information, see:\n")
-	fmt.Fprintf(os.Stderr, "\thttp://godoc.org/golang.org/x/tools/cmd/stringer\n")
+	fmt.Fprintf(os.Stderr, "\tenumerator [flags] -type T [directory]\n")
+	fmt.Fprintf(os.Stderr, "\tenumerator [flags[ -type T files... # Must be a single package\n")
 	fmt.Fprintf(os.Stderr, "Flags:\n")
 	flag.PrintDefaults()
 }
@@ -106,6 +127,28 @@ func main() {
 		os.Exit(2)
 	}
 	types := strings.Split(*typeNames, ",")
+	maps := strings.Split(*mapNames, ",")
+	switch {
+	case len(*mapNames) == 0:
+		maps = make([]string, len(*typeNames))
+		for i, t := range types {
+			r := append([]rune(t), 's')
+			r[0] = unicode.ToLower(r[0])
+			maps[i] = string(r)
+		}
+	case len(maps) != len(types):
+		fmt.Println(len(maps), len(types))
+		flag.Usage()
+		os.Exit(3)
+	default:
+		for i, t := range types {
+			if maps[i] == "" {
+				r := append([]rune(t), 's')
+				r[0] = unicode.ToLower(r[0])
+				maps[i] = string(r)
+			}
+		}
+	}
 
 	// We accept either one directory or a list of files. Which do we have?
 	args := flag.Args()
@@ -128,15 +171,19 @@ func main() {
 	}
 
 	// Print the header and package clause.
-	g.Printf("// Code generated by \"stringer %s\"; DO NOT EDIT\n", strings.Join(os.Args[1:], " "))
+	g.Printf("// Code generated by \"enumerator %s\"; DO NOT EDIT\n", strings.Join(os.Args[1:], " "))
 	g.Printf("\n")
 	g.Printf("package %s", g.pkg.name)
 	g.Printf("\n")
-	g.Printf("import \"fmt\"\n") // Used by all methods.
+	g.Printf("import (\n")
+	g.Printf("\t\"database/sql/driver\"\n")
+	g.Printf("\t\"errors\"\n")
+	g.Printf("\t\"fmt\"\n")
+	g.Printf(")\n")
 
 	// Run generate for each type.
-	for _, typeName := range types {
-		g.generate(typeName)
+	for i, typeName := range types {
+		g.generate(typeName, maps[i])
 	}
 
 	// Format the output.
@@ -145,7 +192,7 @@ func main() {
 	// Write to file.
 	outputName := *output
 	if outputName == "" {
-		baseName := fmt.Sprintf("%s_string.go", types[0])
+		baseName := fmt.Sprintf("%s_enum.go", types[0])
 		outputName = filepath.Join(dir, strings.ToLower(baseName))
 	}
 	err := ioutil.WriteFile(outputName, src, 0644)
@@ -272,7 +319,7 @@ func (pkg *Package) check(fs *token.FileSet, astFiles []*ast.File) {
 }
 
 // generate produces the String method for the named type.
-func (g *Generator) generate(typeName string) {
+func (g *Generator) generate(typeName, mapName string) {
 	values := make([]Value, 0, 100)
 	for _, file := range g.pkg.files {
 		// Set the state for this run of the walker.
@@ -287,6 +334,7 @@ func (g *Generator) generate(typeName string) {
 	if len(values) == 0 {
 		log.Fatalf("no values defined for type %s", typeName)
 	}
+	/*
 	runs := splitIntoRuns(values)
 	// The decision of which pattern to use depends on the number of
 	// runs in the numbers. If there's only one, it's easy. For more than
@@ -307,6 +355,14 @@ func (g *Generator) generate(typeName string) {
 		g.buildMultipleRuns(runs, typeName)
 	default:
 		g.buildMap(runs, typeName)
+	}
+	*/
+	tpl := template.Must(template.New("code_enum").Parse(codeTemplate))
+	x := struct{Name string
+				MapName string} {typeName, mapName}
+	err := tpl.Execute(&g.buf, x)
+	if err != nil {
+		log.Fatal(err.Error())
 	}
 }
 
@@ -634,5 +690,58 @@ const stringMap = `func (i %[1]s) String() string {
 		return str
 	}
 	return fmt.Sprintf("%[1]s(%%d)", i)
+}
+`
+
+// Arguments to the template is a struct with:
+//	[1]: Name field that corresponds to the enumerated type name
+//	[2]: MapName field that corresponds to the map or the array
+//	which has all the corresponding string values.
+const codeTemplate = `
+// String converts a {{$.Name}} constant to appropriate string equivalent
+func (e {{$.Name}}) String() string {
+	return {{$.MapName}}[e]
+}
+
+// ErrInvalid{{$.Name}} returns an error to be used for invalid values
+func ErrInvalid{{$.Name}}(v interface{}) error {
+	return fmt.Errorf("invalid {{$.Name}} %v", v)
+}
+
+// Parse{{$.Name}} parses a string to one of the enumerations
+// of {{$.Name}}
+func Parse{{$.Name}}(e string) ({{$.Name}}, error) {
+	for i, r := range {{$.MapName}} {
+		if e == r {
+			return {{$.Name}}(i), nil
+		}
+	}
+	return {{$.Name}}(0), ErrInvalid{{$.Name}}(e)
+}
+
+// Scan implements the Scanner interface.
+func (e *{{$.Name}}) Scan(value interface{}) error {
+	if e == nil {
+		return errors.New("destination pointer is nil")
+	}
+	event := {{$.Name}}(0)
+	var err error
+	if value != nil {
+		switch value.(type) {
+		case []byte:
+			event, err = Parse{{$.Name}}(string(value.([]byte)))
+		case string:
+			event, err = Parse{{$.Name}}(value.(string))
+		default:
+			err = fmt.Errorf("unsupported driver -> Scan pair: %T -> %T", value, e)
+		}
+	}
+	*e = event
+	return err
+}
+
+// Value implements the driver Valuer interface.
+func (e {{$.Name}}) Value() (driver.Value, error) {
+	return driver.Value(e.String()), nil
 }
 `
